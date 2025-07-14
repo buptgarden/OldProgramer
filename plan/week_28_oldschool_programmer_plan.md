@@ -67,7 +67,7 @@
   - [Beej’s 网络编程指南](https://beej.us/guide/bgnet/)
   - [epoll 教程](https://man7.org/linux/man-pages/man7/epoll.7.html)
 
----
+---q
 
 ### 📅 周六（7.13）Go 并发编程实践
 
@@ -109,12 +109,4 @@ week28/
 ```
 
 ---
-
-## 🚀 备注与建议
-
-- 每日控制时间：3-4 小时核心学习 + 1 小时复盘
-- 用 Git 版本管理你的代码与文档，形成积累
-- 遇到问题不要百度，尽量用 `man`, Stack Overflow, 官方文档解决
-- 保持手敲代码，避免复制粘贴
-- 允许卡壳、但不要放弃：每一次 debug 都是系统性成长的机会
 
