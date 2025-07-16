@@ -79,6 +79,12 @@ typedef struct
 
 server_t *g_server = NULL;
 
+void *worker_thread(void *arg);
+void handle_client(int client_fd, int epoll_fd);
+void signal_handler(int sig);
+int create_server_socket(int port);
+void server_accept_connection(int listen_fd, int epoll_fd);
+
 void log_message(log_level_t level, const char *format, ...)
 {
     time_t now;
@@ -177,7 +183,7 @@ memory_pool_t *memory_pool_create(size_t node_size, size_t pool_size)
     return pool;
 }
 
-void *memory_poll_alloc(memory_pool_t *pool)
+void *memory_pool_alloc(memory_pool_t *pool)
 {
     if (!pool)
     {
@@ -187,26 +193,19 @@ void *memory_poll_alloc(memory_pool_t *pool)
     pthread_mutex_lock(&pool->mutex);
 
     memory_node_t *node = pool->free_list;
-    if (node)
-    {
-        pool->free_list = node->next;
-        node->in_use = 1;
-        pool->used_count++;
-    }
 
-    pthread_mutex_unlock(&pool->mutex);
-
-    if (!pool->free_list)
+    if (!node)
     {
         pthread_mutex_unlock(&pool->mutex);
         log_message(LOG_ERROR, "Memory Pool exhausted");
         return NULL;
     }
 
-    memory_node_t *node = pool->free_list;
     pool->free_list = node->next;
     node->in_use = 1;
     pool->used_count++;
+
+    pthread_mutex_unlock(&pool->mutex);
 
     return node->data;
 }
@@ -312,7 +311,7 @@ void cleanup_connection(int fd)
         remove_from_epoll(g_server->epoll_fd, fd);
 
         pthread_mutex_lock(&g_server->status_mutex);
-        g_server->connection_count;
+        g_server->connection_count--;
         pthread_mutex_unlock(&g_server->status_mutex);
         log_message(LOG_DEBUG, "Connection closed: fd=%d, active_connections=%d", fd, g_server->connection_count);
     }
@@ -368,9 +367,9 @@ thread_pool_t *thread_pool_create(int thread_count, int queue_size)
         return NULL;
     }
 
-    if (pthread_mutex_init(&pool->queue_cond, NULL) != 0)
+    if (pthread_cond_init(&pool->queue_cond, NULL) != 0)
     {
-        log_message(LOG_ERROR, "Failed to initialize mutex");
+        log_message(LOG_ERROR, "Failed to initialize   cond");
         pthread_mutex_destroy(&pool->queue_mutex);
         free(pool->task_queue);
         free(pool->threads);
@@ -406,7 +405,7 @@ thread_pool_t *thread_pool_create(int thread_count, int queue_size)
     return pool;
 }
 
-int tread_pool_add_task(thread_pool_t *pool, task_t *task)
+int thread_pool_add_task(thread_pool_t *pool, task_t *task)
 {
     if (!pool || !task)
     {
@@ -528,76 +527,293 @@ void thread_pool_destroy(thread_pool_t *pool)
 
     log_message(LOG_INFO, "Thread pool destroyed");
 }
-
-int main(int argc, char *argv[])
+void handle_client(int client_fd, int epoll_fd)
 {
+    char *buffer = memory_pool_alloc(g_server->memory_pool);
+    if (!buffer)
+    {
+        log_message(LOG_ERROR, "Failed to allocate buffer for client %d", client_fd);
+        cleanup_connection(client_fd);
+        return;
+    }
+    size_t bytes_read = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+    if (bytes_read <= 0)
+    {
+        if (bytes_read == 0)
+        {
+            log_message(LOG_INFO, "Client %d disconnected", client_fd);
+        }
+        else
+        {
+            log_message(LOG_ERROR, "Failed to read data from client %d", client_fd);
+        }
+        memory_pool_free(g_server->memory_pool, buffer);
+        cleanup_connection(client_fd);
+        return;
+    }
+    buffer[bytes_read] = '\0';
+    log_message(LOG_INFO, "Received from client %d: %s", client_fd, buffer);
 
+    ssize_t bytes_sent = send(client_fd, buffer, bytes_read, 0);
+    if (bytes_sent == -1)
+    {
+        log_message(LOG_ERROR, "Failed to send data to client %d", client_fd);
+        memory_pool_free(g_server->memory_pool, buffer);
+        cleanup_connection(client_fd);
+        return;
+    }
+    log_message(LOG_INFO, "Sent to client %d: %s", client_fd, buffer);
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.fd = client_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev) == -1)
+    {
+        log_message(LOG_ERROR, "Failed to modify epoll event for client %d", client_fd);
+        memory_pool_free(g_server->memory_pool, buffer);
+        cleanup_connection(client_fd);
+        return;
+    }
+    memory_pool_free(g_server->memory_pool, buffer);
+}
+
+int create_server_socket(int port)
+{
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1)
     {
-        perror("socket");
-        exit(1);
+        log_message(LOG_ERROR, "Failed to create server socket");
+        return -1;
+    }
+
+    int opt = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1)
+    {
+        log_message(LOG_ERROR, "Failed to set socket option");
+        return -1;
     }
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(8080);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
 
-    bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
-
-    listen(sockfd, 10);
-
-    int epollfd = epoll_create1(0);
-    if (epollfd == -1)
+    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1)
     {
-        perror("epoll_create1");
-        exit(1);
+        log_message(LOG_ERROR, "Failed to bind socket");
+        close(sockfd);
+        return -1;
+    };
+
+    if (listen(sockfd, MAX_CONNECTIONS) == -1)
+    {
+        log_message(LOG_ERROR, "Failed to listen socket");
+        close(sockfd);
+        return -1;
     }
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = sockfd;
+    if (set_nonblocking(sockfd) == -1)
+    {
+        log_message(LOG_ERROR, "Failed to set nonblocking socket");
+        close(sockfd);
+        return -1;
+    }
 
-    epoll_ctl(epollfd, EPOLL_CTL_ADD, sockfd, &ev);
+    log_message(LOG_INFO, "Server socket created and listening on port %d", port);
 
-    struct epoll_event events[10];
+    return sockfd;
+}
+
+void server_accept_connection(int listen_fd, int epoll_fd)
+{
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
     while (1)
     {
-        int nfds = epoll_wait(epollfd, events, 10, -1);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd == -1)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                break;
+            }
+            log_message(LOG_ERROR, "Failed to accept connection: %s", strerror(errno));
+            return;
+        }
+
+        if (set_nonblocking(client_fd) == -1)
+        {
+            log_message(LOG_ERROR, "Failed to set nonblocking socket");
+            close(client_fd);
+            continue;
+        }
+        if (add_to_epoll(epoll_fd, client_fd, EPOLLIN | EPOLLET) == -1)
+        {
+            log_message(LOG_ERROR, "Failed to add to epoll");
+            close(client_fd);
+            continue;
+        }
+
+        pthread_mutex_lock(&g_server->status_mutex);
+        g_server->connection_count++;
+        pthread_mutex_unlock(&g_server->status_mutex);
+
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+        log_message(LOG_INFO, "New connection accepted: fd=%d, ip=%s:%d, active_connections=%d",
+                    client_fd, client_ip, ntohs(client_addr.sin_port), g_server->connection_count);
+    }
+}
+
+void signal_handler(int sig)
+{
+    log_message(LOG_INFO, "Signal %d received, shutting down...", sig);
+    if (g_server)
+    {
+        g_server->running = 0;
+    }
+}
+
+void server_destroy(server_t *server)
+{
+    if (!server)
+    {
+        return;
+    }
+
+    log_message(LOG_INFO, "Server is shutting down...");
+    server->running = 0;
+    if (server->pool)
+    {
+        thread_pool_destroy(server->pool);
+    }
+
+    if (server->memory_pool)
+    {
+        memory_pool_destroy(server->memory_pool);
+    }
+
+    if (server->epoll_fd >= 0)
+    {
+        close(server->epoll_fd);
+    }
+
+    if (server->listen_fd >= 0)
+    {
+        close(server->listen_fd);
+    }
+
+    pthread_mutex_destroy(&server->status_mutex);
+    free(server);
+
+    log_message(LOG_INFO, "Server shutdown complete");
+}
+
+int main(int argc, char *argv[])
+{
+
+    g_server = malloc(sizeof(server_t));
+    if (!g_server)
+    {
+        log_message(LOG_ERROR, "Failed to create server");
+        return EXIT_FAILURE;
+    }
+
+    memset(g_server, 0, sizeof(server_t));
+    g_server->running = 1;
+    g_server->connection_count = 0;
+
+    if (pthread_mutex_init(&g_server->status_mutex, NULL) != 0)
+    {
+        log_message(LOG_ERROR, "Failed to initialize status mutex");
+        return EXIT_FAILURE;
+    }
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    log_message(LOG_INFO, "Starting echo server ...");
+
+    g_server->listen_fd = create_server_socket(SERVER_PORT);
+    if (g_server->listen_fd == -1)
+    {
+        log_message(LOG_ERROR, "Failed to create server socket");
+        server_destroy(g_server);
+        return EXIT_FAILURE;
+    }
+
+    g_server->epoll_fd = epoll_create1(0);
+    if (g_server->epoll_fd == -1)
+    {
+        log_message(LOG_ERROR, "Failed to create epoll");
+        server_destroy(g_server);
+        return EXIT_FAILURE;
+    }
+
+    if (add_to_epoll(g_server->epoll_fd, g_server->listen_fd, EPOLLIN) == -1)
+    {
+        log_message(LOG_ERROR, "Failed to add to epoll");
+        server_destroy(g_server);
+        return EXIT_FAILURE;
+    }
+
+    g_server->pool = thread_pool_create(THREAD_POOL_SIZE, TASK_QUEUE_SIZE);
+    if (!g_server->pool)
+    {
+        log_message(LOG_ERROR, "Failed to create thread pool");
+        server_destroy(g_server);
+        return EXIT_FAILURE;
+    }
+
+    g_server->memory_pool = memory_pool_create(BUFFER_SIZE, MEMORY_POOL_SIZE);
+    if (!g_server->memory_pool)
+    {
+        log_message(LOG_ERROR, "Failed to create memory pool");
+        server_destroy(g_server);
+        return EXIT_FAILURE;
+    }
+
+    log_message(LOG_INFO, "Server is running on port %d", SERVER_PORT);
+
+    struct epoll_event events[MAX_EVENTS];
+    while (g_server->running)
+    {
+        int nfds = epoll_wait(g_server->epoll_fd, events, MAX_EVENTS, 1000);
         if (nfds == -1)
         {
-            perror("epoll_wait");
-            exit(1);
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            log_message(LOG_ERROR, "Failed to epoll_wait");
+            break;
         }
 
         for (int i = 0; i < nfds; i++)
         {
-            if (events[i].data.fd == sockfd)
-            {
-                int connfd = accept(sockfd, NULL, NULL);
-                if (connfd == -1)
-                {
-                    perror("accept");
-                    exit(1);
-                }
-                printf("accept %d\n", connfd);
+            int fd = events[i].data.fd;
 
-                ev.events = EPOLLIN;
-                ev.data.fd = connfd;
-                epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev);
-            }
-            else if (events[i].events & EPOLLIN)
+            if (fd == g_server->listen_fd)
             {
-                char buf[1024];
-                int n = read(events[i].data.fd, buf, 1024);
-                if (n == -1)
+                server_accept_connection(g_server->listen_fd, g_server->epoll_fd);
+            }
+            else if (events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR))
+            {
+                task_t task;
+                task.client_fd = fd;
+                task.epoll_fd = g_server->epoll_fd;
+                task.handler = handle_client;
+                if (thread_pool_add_task(g_server->pool, &task) == -1)
                 {
-                    perror("read");
-                    exit(1);
+                    log_message(LOG_ERROR, "Failed to add task to thread pool");
+                    cleanup_connection(fd);
                 }
-                printf("read %s\n", buf);
             }
         }
     }
+
+    server_destroy(g_server);
+
+    return EXIT_SUCCESS;
 }
